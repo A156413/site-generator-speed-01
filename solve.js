@@ -12,7 +12,7 @@ const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&
 
 /** `text` with & < > " and ' escaped. Called on whole runs of text, never per character. */
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  return s.search(/[&<>"']/) === -1 ? s : s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
 const SLUG_MAX = 64;
@@ -31,7 +31,8 @@ function slugifyRaw(text) {
   if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
-  for (const ch of plain) {
+  for (let i = 0; i < plain.length; i++) {
+    const ch = plain[i];
     let keep = null;
     if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
     else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
@@ -76,7 +77,14 @@ function countWords(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    const c = text.charCodeAt(i);
+    if (c > 32) {
+      if (!inWord) {
+        inWord = true;
+        n++;
+      }
+    } else if (c === 32 || c === 10) inWord = false;
+    else if (isWsCode(c)) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
@@ -573,6 +581,22 @@ function lookup(scope, path) {
   return v;
 }
 
+/** lookup for a one-name path (most template paths are one or two names). */
+function lookup1(scope, head) {
+  let s = scope;
+  while (s !== null && !Object.hasOwn(s.vars, head)) s = s.parent;
+  return s === null ? undefined : s.vars[head];
+}
+
+/** lookup for a two-name path. */
+function lookup2(scope, head, key) {
+  let s = scope;
+  while (s !== null && !Object.hasOwn(s.vars, head)) s = s.parent;
+  if (s === null) return undefined;
+  const v = s.vars[head];
+  return v === null || typeof v !== 'object' || !Object.hasOwn(v, key) ? undefined : v[key];
+}
+
 /** A value as text: a string itself, a number in JavaScript's digits, true or false, an array's items joined by ", ", else "". */
 function textOf(v) {
   if (typeof v === 'string') return v;
@@ -600,6 +624,8 @@ const TPL_HELPERS = {
   tx: textOf,
   tr: truthy,
   lk: lookup,
+  lk1: lookup1,
+  lk2: lookup2,
   inc(name, scope, ctx, depth) {
     if (depth >= INCLUDE_DEPTH) return '';
     const nodes = ctx.templates.get(name);
@@ -609,25 +635,27 @@ const TPL_HELPERS = {
 
 function compileTemplate(nodes) {
   const paths = [];
+  const lkCall = (scopeVar, path) => {
+    if (path.length === 1) return `H.lk1(${scopeVar},${JSON.stringify(path[0])})`;
+    if (path.length === 2) return `H.lk2(${scopeVar},${JSON.stringify(path[0])},${JSON.stringify(path[1])})`;
+    paths.push(path);
+    return `H.lk(${scopeVar},P[${paths.length - 1}])`;
+  };
   const gen = (list, scopeVar, level) => {
     let code = '';
     for (const n of list) {
       if (n.kind === 'text') {
         if (n.text !== '') code += `out+=${JSON.stringify(n.text)};`;
       } else if (n.kind === 'var') {
-        paths.push(n.path);
-        code += `out+=H.esc(H.tx(H.lk(${scopeVar},P[${paths.length - 1}])));`;
+        code += `out+=H.esc(H.tx(${lkCall(scopeVar, n.path)}));`;
       } else if (n.kind === 'raw') {
-        paths.push(n.path);
-        code += `out+=H.tx(H.lk(${scopeVar},P[${paths.length - 1}]));`;
+        code += `out+=H.tx(${lkCall(scopeVar, n.path)});`;
       } else if (n.kind === 'if') {
-        paths.push(n.path);
-        code += `if(H.tr(H.lk(${scopeVar},P[${paths.length - 1}]))!==${n.not}){${gen(n.then, scopeVar, level)}}`;
+        code += `if(H.tr(${lkCall(scopeVar, n.path)})!==${n.not}){${gen(n.then, scopeVar, level)}}`;
         if (n.else !== null) code += `else{${gen(n.else, scopeVar, level)}}`;
       } else if (n.kind === 'for') {
-        paths.push(n.path);
         const child = `s${level + 1}`;
-        code += `{const xs=H.lk(${scopeVar},P[${paths.length - 1}]);if(Array.isArray(xs)){for(let k=0;k<xs.length;k++){const ${child}={vars:{[${JSON.stringify(n.name)}]:xs[k],loop:{index:k+1,first:k===0,last:k===xs.length-1,length:xs.length}},parent:${scopeVar}};${gen(n.body, child, level + 1)}}}}`;
+        code += `{const xs=${lkCall(scopeVar, n.path)};if(Array.isArray(xs)){for(let k=0;k<xs.length;k++){const ${child}={vars:{[${JSON.stringify(n.name)}]:xs[k],loop:{index:k+1,first:k===0,last:k===xs.length-1,length:xs.length}},parent:${scopeVar}};${gen(n.body, child, level + 1)}}}}`;
       } else if (n.kind === 'include') {
         code += `out+=H.inc(${JSON.stringify(n.name)},${scopeVar},ctx,depth);`;
       }
