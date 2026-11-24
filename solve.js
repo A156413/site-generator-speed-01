@@ -9,10 +9,25 @@
 // ---------------------------------------------------------------- text
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_RE = /[&<>"']/g;
 
-/** `text` with & < > " and ' escaped. Called on whole runs of text, never per character. */
+/**
+ * `text` with & < > " and ' escaped. Called on whole runs of text, never per character. One scan:
+ * the regex finds each character to escape and the runs between them are copied whole. This
+ * function never calls itself, so the shared regex's lastIndex is safe.
+ */
 function escapeHtml(s) {
-  return s.search(/[&<>"']/) === -1 ? s : s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  ESC_RE.lastIndex = 0;
+  const m = ESC_RE.exec(s);
+  if (m === null) return s;
+  let out = s.slice(0, m.index) + ESCAPES[m[0]];
+  let last = m.index + 1;
+  let n;
+  while ((n = ESC_RE.exec(s)) !== null) {
+    out += s.slice(last, n.index) + ESCAPES[n[0]];
+    last = n.index + 1;
+  }
+  return out + s.slice(last);
 }
 
 const SLUG_MAX = 64;
@@ -58,10 +73,9 @@ function uniqueSlug(slug, taken) {
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-/** A YYYY-MM-DD date in words, from the string alone. */
+/** A YYYY-MM-DD date in words, from the string alone (the format is front-matter validated). */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
 /** Whether a code unit is JavaScript whitespace (what \s matches, and so what \S is not). */
@@ -448,7 +462,9 @@ function renderMarkdown(src, env, slugify) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      out += `${open}\n${items.map((parts) => `<li>${inline(parts.join('\n'), env)}</li>\n`).join('')}</${tag}>\n`;
+      let listHtml = `${open}\n`;
+      for (const parts of items) listHtml += `<li>${inline(parts.join('\n'), env)}</li>\n`;
+      out += `${listHtml}</${tag}>\n`;
       continue;
     }
     const body = [trimLine(line)];
@@ -602,7 +618,14 @@ function textOf(v) {
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (Array.isArray(v)) return v.map(textOf).join(', ');
+  if (Array.isArray(v)) {
+    let out = '';
+    for (let k = 0; k < v.length; k++) {
+      if (k > 0) out += ', ';
+      out += textOf(v[k]);
+    }
+    return out;
+  }
   return '';
 }
 
@@ -619,27 +642,31 @@ function truthy(v) {
  * include past INCLUDE_DEPTH renders nothing, exactly as the walking renderer did.
  */
 const compiledTemplates = new WeakMap();
-const TPL_HELPERS = {
-  esc: escapeHtml,
-  tx: textOf,
-  tr: truthy,
-  lk: lookup,
-  lk1: lookup1,
-  lk2: lookup2,
-  inc(name, scope, ctx, depth) {
-    if (depth >= INCLUDE_DEPTH) return '';
+
+/** A compiled template run with the helpers bound as plain arguments, so the generated body makes no property loads. */
+function callCompiled(c, scope, ctx, depth) {
+  return c.fn(scope, ctx, depth, escapeHtml, textOf, truthy, lookup, lookup1, lookup2, includeTemplate, c.paths);
+}
+
+/** An include rendered from the caller's depth: nothing at or past INCLUDE_DEPTH, "" for a name that does not parse. */
+function includeTemplate(name, scope, ctx, depth) {
+  if (depth >= INCLUDE_DEPTH) return '';
+  let c = ctx.cc.get(name);
+  if (c === undefined) {
     const nodes = ctx.templates.get(name);
-    return nodes === undefined ? '' : renderTemplate(nodes, scope, ctx, depth + 1);
-  },
-};
+    c = nodes === undefined ? null : compileTemplate(nodes);
+    ctx.cc.set(name, c);
+  }
+  return c === null ? '' : callCompiled(c, scope, ctx, depth + 1);
+}
 
 function compileTemplate(nodes) {
   const paths = [];
   const lkCall = (scopeVar, path) => {
-    if (path.length === 1) return `H.lk1(${scopeVar},${JSON.stringify(path[0])})`;
-    if (path.length === 2) return `H.lk2(${scopeVar},${JSON.stringify(path[0])},${JSON.stringify(path[1])})`;
+    if (path.length === 1) return `lk1(${scopeVar},${JSON.stringify(path[0])})`;
+    if (path.length === 2) return `lk2(${scopeVar},${JSON.stringify(path[0])},${JSON.stringify(path[1])})`;
     paths.push(path);
-    return `H.lk(${scopeVar},P[${paths.length - 1}])`;
+    return `lk(${scopeVar},P[${paths.length - 1}])`;
   };
   const gen = (list, scopeVar, level) => {
     let code = '';
@@ -647,22 +674,33 @@ function compileTemplate(nodes) {
       if (n.kind === 'text') {
         if (n.text !== '') code += `out+=${JSON.stringify(n.text)};`;
       } else if (n.kind === 'var') {
-        code += `out+=H.esc(H.tx(${lkCall(scopeVar, n.path)}));`;
+        code += `out+=esc(tx(${lkCall(scopeVar, n.path)}));`;
       } else if (n.kind === 'raw') {
-        code += `out+=H.tx(${lkCall(scopeVar, n.path)});`;
+        code += `out+=tx(${lkCall(scopeVar, n.path)});`;
       } else if (n.kind === 'if') {
-        code += `if(H.tr(${lkCall(scopeVar, n.path)})!==${n.not}){${gen(n.then, scopeVar, level)}}`;
+        code += `if(tr(${lkCall(scopeVar, n.path)})!==${n.not}){${gen(n.then, scopeVar, level)}}`;
         if (n.else !== null) code += `else{${gen(n.else, scopeVar, level)}}`;
       } else if (n.kind === 'for') {
         const child = `s${level + 1}`;
-        code += `{const xs=${lkCall(scopeVar, n.path)};if(Array.isArray(xs)){for(let k=0;k<xs.length;k++){const ${child}={vars:{[${JSON.stringify(n.name)}]:xs[k],loop:{index:k+1,first:k===0,last:k===xs.length-1,length:xs.length}},parent:${scopeVar}};${gen(n.body, child, level + 1)}}}}`;
+        const key = JSON.stringify(n.name);
+        if (n.name === 'loop' || n.name === '__proto__') {
+          // A variable named loop or __proto__ cannot share the reused scope objects below with
+          // the same meaning (the literal's loop wins; assignment to __proto__ sets a prototype),
+          // so those loops keep a fresh scope per item, exactly as before.
+          code += `{const xs=${lkCall(scopeVar, n.path)};if(Array.isArray(xs)){for(let k=0;k<xs.length;k++){const ${child}={vars:{[${key}]:xs[k],loop:{index:k+1,first:k===0,last:k===xs.length-1,length:xs.length}},parent:${scopeVar}};${gen(n.body, child, level + 1)}}}}`;
+        } else {
+          // One child scope per loop, its vars and loop record mutated per item: rendering is
+          // synchronous and the scope is only read while its item is current, so this is the
+          // same scope chain the per-item objects made, with a fraction of the allocation.
+          code += `{const xs=${lkCall(scopeVar, n.path)};if(Array.isArray(xs)){const lp={index:0,first:false,last:false,length:xs.length};const vs={[${key}]:undefined,loop:lp};const ${child}={vars:vs,parent:${scopeVar}};for(let k=0;k<xs.length;k++){vs[${key}]=xs[k];lp.index=k+1;lp.first=k===0;lp.last=k===xs.length-1;${gen(n.body, child, level + 1)}}}}`;
+        }
       } else if (n.kind === 'include') {
-        code += `out+=H.inc(${JSON.stringify(n.name)},${scopeVar},ctx,depth);`;
+        code += `out+=inc(${JSON.stringify(n.name)},${scopeVar},ctx,depth);`;
       }
     }
     return code;
   };
-  const fn = new Function('s0', 'ctx', 'depth', 'H', 'P', `let out='';${gen(nodes, 's0', 0)}return out;`);
+  const fn = new Function('s0', 'ctx', 'depth', 'esc', 'tx', 'tr', 'lk', 'lk1', 'lk2', 'inc', 'P', `let out='';${gen(nodes, 's0', 0)}return out;`);
   return { fn, paths };
 }
 
@@ -673,7 +711,7 @@ function renderTemplate(nodes, scope, ctx, depth) {
     c = compileTemplate(nodes);
     compiledTemplates.set(nodes, c);
   }
-  return c.fn(scope, ctx, depth, TPL_HELPERS, c.paths);
+  return callCompiled(c, scope, ctx, depth);
 }
 
 // ---------------------------------------------------------------- the build
@@ -801,6 +839,17 @@ export function build(input) {
 
   // 4. Markdown, its links resolved to the pages and static files they name.
   const staticPaths = new Set(b.statics.map((f) => f.path));
+  // The same relative link recurs across a directory's pages: resolve each (dir, rel) pair once.
+  const pathCache = new Map();
+  const resolveCached = (dir, rel) => {
+    const key = `${dir.length}:${dir}${rel}`;
+    let path = pathCache.get(key);
+    if (path === undefined) {
+      path = resolvePath(dir, rel);
+      pathCache.set(key, path);
+    }
+    return path;
+  };
   for (const s of b.sources) {
     const dir = dirOf(s.path);
     const env = {
@@ -809,7 +858,7 @@ export function build(input) {
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        const path = rel === '' ? null : resolveCached(dir, rel);
         if (path !== null && b.bySource.has(path)) return `${b.bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
         b.broken.add(`broken-link ${s.path} -> ${target}`);
@@ -890,7 +939,7 @@ export function build(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates };
+  const ctx = { templates, cc: new Map() };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     return nodes === undefined ? null : renderTemplate(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
